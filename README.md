@@ -1,6 +1,16 @@
 # Telecat
 A telegram bot to control and get status from hashcat.
 
+## Setup/Usage
+Just add your user id and bot token in config.json. 
+
+Bot supports:
+* /launch
+* /stats (with /stats interval and /stats STOP for automatic status messages)
+* /pause and /resume
+* /quit
+
+## Example:
 ```
 Gerry, [Sep 14, 2016, 1:13 PM]: 
 /launch -w 3 -m 0 /home/gerry/test /home/gerry/wordlists/merged.txt -r /home/gerry/rules/hob064.rule
