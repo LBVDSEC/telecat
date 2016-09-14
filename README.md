@@ -9,6 +9,7 @@ Bot supports:
 * /stats (with /stats interval and /stats STOP for automatic status messages)
 * /pause and /resume
 * /quit
+* Downloading sent text files.
 
 ## Example:
 ```

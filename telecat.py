@@ -1,9 +1,11 @@
 #!/usr/bin/env python
+import os
 import sys
 import logging
 import threading
 import json
 import time
+import tempfile
 from functools import wraps
 import pyhashcat
 try:
@@ -169,6 +171,24 @@ def unknown(bot, update):
                          text="Sorry, I didn't understand that command.")
 
 
+@admin_required
+def receive_file(bot, update):
+    doc = update.message.document
+    if doc.mime_type != 'text/plain':
+        bot.send_message(chat_id=update.message.chat_id,
+                         text="Sorry, only 'text/plain' files are supported.")
+        return
+    logging.info('%s sent a file: %s' % (update.message.from_user.username, doc.file_name))
+    infile = bot.get_file(doc.file_id)
+    upload_dir = os.path.expanduser(DOWNLOAD_PATH)
+    prefix = "%s_" % update.message.from_user.username
+    (fd, file_name) = tempfile.mkstemp(prefix=prefix, dir=upload_dir)
+    infile.download(file_name)
+    bot.send_message(chat_id=update.message.chat_id,
+                     text="File saved as %s" % file_name)
+    logging.info("File saved as %s" % file_name)
+
+
 def error(bot, update, error):
     logger.warn('Update "%s" caused error "%s"' % (update, error))
 
@@ -209,26 +229,29 @@ def format_stats(stats, cmd_line):
 
 
 def load_config(config_filename=CONFIG_FILENAME):
+    global ADMINS
+    global BOT_TOKEN
+    global WATCHERS
+    global DOWNLOAD_PATH
+
     with open(config_filename) as config_file:
-        return json.load(config_file)
+        config = json.load(config_file)
+        BOT_TOKEN = config.get('BOT_TOKEN')
+        ADMINS = config.get('admins')
+        WATCHERS = config.get('watchers')
+        DOWNLOAD_PATH = config.get('download_path', './uploads')
+        return config
 
 
 def main():
-    global ADMINS
-    global WATCHERS
-
     config = load_config()
     if not config:
         logger.error("No config file could be loaded.")
         sys.exit(-1)
 
-    BOT_TOKEN = config.get('BOT_TOKEN')
     if not BOT_TOKEN:
         logger.error("No BOT_TOKEN defined.")
         sys.exit(-1)
-
-    ADMINS = config.get('admins')
-    WATCHERS = config.get('watchers')
 
     updater = Updater(token=BOT_TOKEN)
 
@@ -240,6 +263,7 @@ def main():
     dp.add_handler(CommandHandler('quit', quit))
     dp.add_handler(CommandHandler('launch', launch, pass_args=True))
     dp.add_handler(MessageHandler([Filters.command], unknown))
+    dp.add_handler(MessageHandler([Filters.document], receive_file))
 
     updater.start_polling()
     updater.idle()
