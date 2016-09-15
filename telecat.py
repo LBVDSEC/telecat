@@ -20,7 +20,6 @@ except ImportError:
 
 # TODO(gerry): Display speed in h/s
 # TODO(gerry): Automatically stop status messages on session completion
-# TODO(gerry): Fix out of sync stats (e.g., on /quit or completion)
 # TODO(gerry): Check for successful execution on /launch
 # TODO(gerry): Combine protected decorators
 
@@ -116,7 +115,7 @@ def send_stats(bot, chat_id, session_complete=False):
     if hashcat.stats:
         msg += format_stats(hashcat.stats, hashcat.command_line)
     if hashcat.output:
-        msg += "*Output*\n`" + hashcat.output + "`"
+        msg += "*Output:*\n`" + hashcat.output + "`"
     bot.sendMessage(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
 

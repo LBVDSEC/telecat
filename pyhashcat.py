@@ -86,7 +86,7 @@ class HashcatController(object):
         time.sleep(1)  # Give hashcat a chance to die fast on errors
         return self.process
 
-    def run(self, stats_timer=3):
+    def run(self, stats_timer=1):
         self.stop_event.clear()
         self.launch()
         while self.process.poll() is None:
