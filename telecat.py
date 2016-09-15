@@ -73,7 +73,7 @@ def start(bot, update):
 @watcher_required
 def stats(bot, update, args, job_queue):
     global USER_JOBS
-    help_msg = "To schedule automatic status messages:\n    /stats interval_in_seconds\n"
+    help_msg = "To schedule automatic status messages:\n    /stats interval_in_mins\n"
     help_msg += "To stop:\n    /stats STOP"
     msg = None
     if args:
@@ -89,7 +89,7 @@ def stats(bot, update, args, job_queue):
             cur_job = USER_JOBS.get(user.id, None)
             if cur_job:
                 cur_job.schedule_removal()
-            job = Job(send_stats_job, float(args[0]), context=update.message.chat_id)
+            job = Job(send_stats_job, float(args[0])*60, context=update.message.chat_id)
             USER_JOBS[user.id] = job
             job_queue.put(job)
             msg = "Automatic status messages %s." % (cur_job and 'updated' or 'started')
