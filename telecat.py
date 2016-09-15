@@ -14,14 +14,15 @@ try:
     from telegram.ext import Updater
     from telegram.ext import CommandHandler
     from telegram.ext import MessageHandler
+    from telegram.ext.dispatcher import run_async
 except ImportError:
     print("Please install python-telegram-bot")
     sys.exit(-1)
 
-# TODO(gerry): Display speed in h/s
-# TODO(gerry): Automatically stop status messages on session completion
+# TODO(gerry): Add usage/help command
 # TODO(gerry): Check for successful execution on /launch
 # TODO(gerry): Combine protected decorators
+# TODO(gerry): remove all hashcat.process.poll() with hashcat.alive or something
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -67,7 +68,11 @@ def start(bot, update):
         bot.send_message(chat_id=ADMINS[0], text="New user request: %s(%s)" % (
             user.id, user.username))
         return
-    bot.send_message(chat_id=update.message.chat_id, text="Nothing to do here.")
+
+    if not hashcat:
+        return bot.send_message(chat_id=update.message.chat_id, text="No current sessions")
+    msg = "*Current Status:*\n" + format_stats(hashcat.stats, hashcat.command_line)
+    bot.send_message(chat_id=update.message.chat_id, text=msg, parse_mode="Markdown")
 
 
 @watcher_required
@@ -103,7 +108,13 @@ def stats(bot, update, args, job_queue):
 
 
 def send_stats_job(bot, job):
-    send_stats(bot, job.context)
+    if not hashcat:
+        return
+    elif hashcat.process and hashcat.process.poll() is not None:
+        print 'job done, removing'
+        job.schedule_removal()
+    elif hashcat.stats:
+        send_stats(bot, job.context)
 
 
 def send_stats(bot, chat_id, session_complete=False):
@@ -116,7 +127,8 @@ def send_stats(bot, chat_id, session_complete=False):
         msg += format_stats(hashcat.stats, hashcat.command_line)
     if hashcat.output:
         msg += "*Output:*\n`" + hashcat.output + "`"
-    bot.sendMessage(chat_id=chat_id, text=msg, parse_mode="Markdown")
+    if len(msg):
+        bot.sendMessage(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
 
 @admin_required
@@ -145,7 +157,7 @@ def quit(bot, update):
 
 
 @admin_required
-def launch(bot, update, args):
+def launch(bot, update, args, job_queue):
     global hashcat
     if hashcat and hashcat.process and hashcat.process.poll() is None:
         return bot.send_message(chat_id=update.message.chat_id, text="Hashcat is already running!")
@@ -153,12 +165,8 @@ def launch(bot, update, args):
     msg = "We need some args!"
     if args:
         hashcat = pyhashcat.HashcatController(args, stop_event)
-        t = threading.Thread(target=hashcat.run)
-        t.setDaemon(True)
-        t.start()
-        t = threading.Thread(target=session_monitor, args=(bot, hashcat, monitor_stop_event))
-        t.setDaemon(True)
-        t.start()
+        run_async(hashcat.run)()
+        run_async(session_monitor)(bot, hashcat, monitor_stop_event)
         msg = "Launched a new scan: `%s`" % " ".join(hashcat.command_line)
     logger.info(msg)
     bot.send_message(chat_id=update.message.chat_id, text=msg, parse_mode="Markdown")
@@ -200,7 +208,7 @@ def session_monitor(bot, hashcat, cancel_event, sleep_time=5):
             logger.info("Notifing watchers.")
             for user_id in WATCHERS + ADMINS:
                 send_stats(bot, user_id, session_complete=True)
-            break
+            return
         time.sleep(sleep_time)
 
 
@@ -208,7 +216,8 @@ def format_stats(stats, cmd_line):
     msg = ["*Current Status:* `%s`" % pyhashcat.STATUS_CODES[stats.get('STATUS')]]
     gpus = []
     for idx, gpu in enumerate(stats.get('SPEED', [])):
-        gpus.append("\tDevice: `%d`\tCount: `%d`\tms: `%f`" % (idx, gpu[0], gpu[1]))
+        hs = int((min(gpu[0], gpu[1]) > 0 and gpu[0]/gpu[1] or 0) * 1000)
+        gpus.append("\tDevice: `%d`\tCount: `%d`\tms: `%f`\th/s: `%d`" % (idx, gpu[0], gpu[1], hs))
     msg += ["*Current Speeds:*\n%s" % "\n".join(gpus)]
     msg += ["*Current Keyspace Unit:* `%s`" % stats.get('CURKU')]
     msg += ["*Progress:* `%d/%d`" % stats.get('PROGRESS')]
@@ -260,7 +269,7 @@ def main():
     dp.add_handler(CommandHandler('pause', pause))
     dp.add_handler(CommandHandler('resume', resume))
     dp.add_handler(CommandHandler('quit', quit))
-    dp.add_handler(CommandHandler('launch', launch, pass_args=True))
+    dp.add_handler(CommandHandler('launch', launch, pass_args=True, pass_job_queue=True))
     dp.add_handler(MessageHandler([Filters.command], unknown))
     dp.add_handler(MessageHandler([Filters.document], receive_file))
 
