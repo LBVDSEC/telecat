@@ -19,12 +19,12 @@ except ImportError:
     print("Please install python-telegram-bot")
     sys.exit(-1)
 
+# TODO(gerry): Rework session_monitor/send_stats/send_stats_job to use hashcat.is_running()
+#              or hashcat.process.returncode/status/stop_event
 # TODO(gerry): Add usage/help command
-# TODO(gerry): Check for successful execution on /launch
 # TODO(gerry): Combine protected decorators
-# TODO(gerry): remove all hashcat.process.poll() with hashcat.alive or something
 
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def admin_required(func):
     @wraps(func)
     def func_wrapper(bot, update, *args, **kwargs):
         user = update.message.from_user
-        if user.id not in ADMINS:
+        if user.id not in config.get('admins'):
             return reject_user(bot, update)
         return func(bot, update, *args, **kwargs)
     return func_wrapper
@@ -53,7 +53,7 @@ def watcher_required(func):
     @wraps(func)
     def func_wrapper(bot, update, *args, **kwargs):
         user = update.message.from_user
-        if user.id not in ADMINS + WATCHERS:
+        if user.id not in config.get('admins') + config.get('watchers'):
             return reject_user(bot, update)
         return func(bot, update, *args, **kwargs)
     return func_wrapper
@@ -62,14 +62,14 @@ def watcher_required(func):
 def start(bot, update):
     global REQUESTED
     user = update.message.from_user
-    if user.id not in ADMINS + WATCHERS + REQUESTED:
+    if user.id not in config.get('admins') + config.get('watchers') + REQUESTED:
         REQUESTED.append(user.id)
         bot.send_message(chat_id=update.message.chat_id, text="Request received.")
-        bot.send_message(chat_id=ADMINS[0], text="New user request: %s(%s)" % (
+        bot.send_message(chat_id=config.get('admins')[0], text="New user request: %s(%s)" % (
             user.id, user.username))
         return
 
-    if not hashcat:
+    if not hashcat.is_running():
         return bot.send_message(chat_id=update.message.chat_id, text="No current sessions")
     msg = "*Current Status:*\n" + format_stats(hashcat.stats, hashcat.command_line)
     bot.send_message(chat_id=update.message.chat_id, text=msg, parse_mode="Markdown")
@@ -101,17 +101,14 @@ def stats(bot, update, args, job_queue):
         else:
             msg = help_msg
         bot.send_message(chat_id=update.message.chat_id, text=msg)
-    if hashcat:
+    if hashcat.is_running():
         send_stats(bot, update.message.chat_id)
     elif msg is None:
         bot.send_message(chat_id=update.message.chat_id, text="Hashcat not running!")
 
 
 def send_stats_job(bot, job):
-    if not hashcat:
-        return
-    elif hashcat.process and hashcat.process.poll() is not None:
-        print 'job done, removing'
+    if hashcat.process and hashcat.process.poll() is not None:
         job.schedule_removal()
     elif hashcat.stats:
         send_stats(bot, job.context)
@@ -119,38 +116,45 @@ def send_stats_job(bot, job):
 
 def send_stats(bot, chat_id, session_complete=False):
     msg = ""
-    if not hashcat:
-        return
     if session_complete:
         msg = "*Session Complete*\n"
     if hashcat.stats:
         msg += format_stats(hashcat.stats, hashcat.command_line)
     if hashcat.output:
         msg += "*Output:*\n`" + hashcat.output + "`"
+    if hashcat.error_output:
+        msg += "*Error:*\n`" + hashcat.error_output + "`"
     if len(msg):
         bot.sendMessage(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
 
 @admin_required
 def pause(bot, update):
-    msg = "Hashcat not running!"
-    if hashcat and hashcat.process:
+    if not hashcat.is_running():
+        msg = "Hashcat not running!"
+    elif hashcat.is_paused():
+        msg = "Already paused."
+    else:
         msg = hashcat.pause() and "Paused" or "Failed to pause!"
     bot.send_message(chat_id=update.message.chat_id, text=msg)
 
 
 @admin_required
 def resume(bot, update):
-    msg = "Hashcat not running!"
-    if hashcat and hashcat.process:
-        msg = hashcat.resume() and "Resume" or "Failed to resume!"
+    if not hashcat.is_running():
+        msg = "Hashcat not running!"
+    elif hashcat.is_paused():
+        msg = "Hashcat not paused."
+    else:
+        msg = hashcat.resume() and "Resumed" or "Failed to resume!"
     bot.send_message(chat_id=update.message.chat_id, text=msg)
 
 
 @admin_required
 def quit(bot, update):
-    msg = "Hashcat not running!"
-    if hashcat and hashcat.process:
+    if not hashcat.is_running():
+        msg = "Hashcat not running!"
+    else:
         msg = "Quiting hashcat session."
         hashcat.quit()
     bot.send_message(chat_id=update.message.chat_id, text=msg)
@@ -158,22 +162,30 @@ def quit(bot, update):
 
 @admin_required
 def launch(bot, update, args, job_queue):
-    global hashcat
-    if hashcat and hashcat.process and hashcat.process.poll() is None:
-        return bot.send_message(chat_id=update.message.chat_id, text="Hashcat is already running!")
+    if hashcat.is_running():
+        return bot.send_message(chat_id=update.message.chat_id,
+                                text="Hashcat is already running!")
 
-    msg = "We need some args!"
+    msg = "We need a command line!"
     if args:
-        hashcat = pyhashcat.HashcatController(args, stop_event)
-        run_async(hashcat.run)()
-        run_async(session_monitor)(bot, hashcat, monitor_stop_event)
-        msg = "Launched a new scan: `%s`" % " ".join(hashcat.command_line)
+        run_async(hashcat.run)(args)
+        run_async(session_monitor)(bot)
+        
+        while not hashcat.is_running():
+            if hashcat.process and hashcat.process.returncode:
+                break
+        if hashcat.process.returncode:
+            bot.send_message(chat_id=update.message.chat_id,
+                             text="Error launching new scan!", parse_mode="Markdown")
+            return send_stats(bot, update.message.chat_id)
+        else:
+            msg = "Launched a new scan: `%s`" % " ".join(hashcat.command_line)
     logger.info(msg)
     bot.send_message(chat_id=update.message.chat_id, text=msg, parse_mode="Markdown")
 
 
 def unknown(bot, update):
-    if update.message.from_user.id in ADMINS + WATCHERS:
+    if update.message.from_user.id in config.get('admins') + config.get('watchers'):
         bot.send_message(chat_id=update.message.chat_id,
                          text="Sorry, I didn't understand that command.")
 
@@ -182,12 +194,11 @@ def unknown(bot, update):
 def receive_file(bot, update):
     doc = update.message.document
     if doc.mime_type != 'text/plain':
-        bot.send_message(chat_id=update.message.chat_id,
-                         text="Sorry, only 'text/plain' files are supported.")
-        return
+        return bot.send_message(chat_id=update.message.chat_id,
+                                text="Sorry, only 'text/plain' files are supported.")
     logging.info('%s sent a file: %s' % (update.message.from_user.username, doc.file_name))
     infile = bot.get_file(doc.file_id)
-    upload_dir = os.path.expanduser(DOWNLOAD_PATH)
+    upload_dir = os.path.expanduser(config.get('download_path', ''))
     prefix = "%s_" % update.message.from_user.username
     (fd, file_name) = tempfile.mkstemp(prefix=prefix, dir=upload_dir)
     infile.download(file_name)
@@ -200,13 +211,14 @@ def error(bot, update, error):
     logger.warn('Update "%s" caused error "%s"' % (update, error))
 
 
-def session_monitor(bot, hashcat, cancel_event, sleep_time=5):
-    while not cancel_event.is_set():
+def session_monitor(bot, sleep_time=5):
+    while not monitor_stop_event.is_set():
+        # TODO(gerry): use is_runnning and STATE
         if hashcat.process and hashcat.process.poll() is not None:
             logger.info("Session completed, waiting for handler to finish...")
             hashcat.stop_event.wait(60)
-            logger.info("Notifing watchers.")
-            for user_id in WATCHERS + ADMINS:
+            logger.info("Notifing config.get('watchers').")
+            for user_id in config.get('watchers') + config.get('admins'):
                 send_stats(bot, user_id, session_complete=True)
             return
         time.sleep(sleep_time)
@@ -220,7 +232,8 @@ def format_stats(stats, cmd_line):
         gpus.append("\tDevice: `%d`\tCount: `%d`\tms: `%f`\th/s: `%d`" % (idx, gpu[0], gpu[1], hs))
     msg += ["*Current Speeds:*\n%s" % "\n".join(gpus)]
     msg += ["*Current Keyspace Unit:* `%s`" % stats.get('CURKU')]
-    msg += ["*Progress:* `%d/%d`" % stats.get('PROGRESS')]
+    prog = stats.get('PROGRESS')
+    msg += ["*Progress:* `%.2f%% (%d/%d)`" % ((float(prog[0])/float(prog[1])*100,) + prog)]
     msg += ["*Recovered Hashes:* `%d/%d`" % stats.get('RECHASH')]
     msg += ["*Recovered Salts:* `%d/%d`" % stats.get('RECSALT')]
     if stats.get('TEMP'):
@@ -237,31 +250,25 @@ def format_stats(stats, cmd_line):
 
 
 def load_config(config_filename=CONFIG_FILENAME):
-    global ADMINS
-    global BOT_TOKEN
-    global WATCHERS
-    global DOWNLOAD_PATH
-
     with open(config_filename) as config_file:
-        config = json.load(config_file)
-        BOT_TOKEN = config.get('BOT_TOKEN')
-        ADMINS = config.get('admins')
-        WATCHERS = config.get('watchers')
-        DOWNLOAD_PATH = config.get('download_path', './uploads')
-        return config
+        return json.load(config_file)
 
 
 def main():
+    global hashcat
+    global config
+
     config = load_config()
     if not config:
         logger.error("No config file could be loaded.")
         sys.exit(-1)
 
-    if not BOT_TOKEN:
+    if not config.get('BOT_TOKEN'):
         logger.error("No BOT_TOKEN defined.")
         sys.exit(-1)
 
-    updater = Updater(token=BOT_TOKEN)
+    hashcat = pyhashcat.HashcatController(stop_event)
+    updater = Updater(token=config.get('BOT_TOKEN'))
 
     dp = updater.dispatcher
     dp.add_handler(CommandHandler('start', start))

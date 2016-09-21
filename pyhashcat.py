@@ -7,8 +7,11 @@ import shlex
 import sys
 import time
 import logging
+import threading
 
-logging.basicConfig(level=logging.INFO,
+# TODO(gerry): Add a hash not found message when applicable
+
+logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -44,20 +47,36 @@ EXIT_CODES = {
 }
 
 
-class HashcatController(object):
+STATE_NEW, STATE_STARTING, STATE_RUNNING, STATE_DONE = range(0, 4)
+CONTROLLER_STATES = {
+    STATE_NEW: 'New',
+    STATE_STARTING: 'Starting new session',
+    STATE_RUNNING: 'Running',
+    STATE_DONE: 'Session complete'
+}
 
-    def __init__(self, command_line, stop_event):
-        self.stats = {}
+class HashcatController(object):
+    STATE_NEW, STATE_STARTING, STATE_RUNNING, STATE_DONE = range(0, 4)
+
+    def __init__(self, stop_event=None):
+        self.stats = None
         self.process = None
         self.outfile_name = None
         self._delete_outfile = False
         self._do_clean_up = True
         self.output = None
-        self.stop_event = stop_event
-        self.command_line = self.build_command_line(command_line)
+        self.error_output = None
+        self.stop_event = stop_event is None and threading.Event() or stop_event
+        self.state = self.STATE_NEW
+        self._status_timer = 1
+        self.p_event = threading.Event() # For pausing
+        self.run_event = threading.Event() # To indicate session is running
 
     def build_command_line(self, command_line):
         required_args = [HASHCAT_PATH, '--quiet', '--status', '--machine-readable']
+        if self._status_timer:
+            required_args.append('--status-timer=%d' % self._status_timer)
+
         if str is type(command_line):
             command_line = shlex.split(command_line)
 
@@ -80,98 +99,116 @@ class HashcatController(object):
         self.outfile_name = outfile_name
         return required_args + command_line
 
-    def launch(self):
-        self.process = subprocess.Popen(self.command_line, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, stdin=subprocess.PIPE)
-        time.sleep(1)  # Give hashcat a chance to die fast on errors
-        return self.process
-
-    def run(self, stats_timer=1):
-        self.stop_event.clear()
-        self.launch()
+    def status_monitor(self):
+        self.output = []
+        self.error_output = None
+        self._status_line = None
         while self.process.poll() is None:
-            stats = self.parse_status_line()
-            if self.stop_event.wait(stats_timer):
+            if not self._status_timer:
+                # will probably need to wrap this in try/except
+                self.process.stdin.write('s')
+            # will probably need to wrap this in try/except
+            line = self.process.stdout.readline()
+            if "Paused" in line:
+                self.p_event.set()
+            elif "Resumed" in line:
+                self.p_event.clear()
+            elif line.startswith("STATUS"):
+                if not self.run_event.is_set():
+                    self.run_event.set()
+                stats = self.parse_status_line(line)  # or read?
+                if stats:                
+                    self.stats = stats
+
+            if self.stop_event.is_set():
                 logger.debug("Got stop event, quiting")
                 self.quit()
-        self.clean_up()
+                break
+        self.state = self.STATE_DONE
+        if EXIT_ERROR == self.process.returncode:
+            stdout, stderr = self.process.communicate()
+            self.output = "\n".join(l for l in stdout.split('\n') if l)
+            self.error_output = "\n".join(l for l in stderr.split('\n') if l)
+            logger.debug('Error: %s' % self.error_output)
+        elif EXIT_CRACKED == self.process.returncode:
+            if self.stats is None or self.stats['STATUS'] != STATUS_CRACKED:
+                logger.debug(self.stats)
+                logger.debug("Found hash in POT file")
+            else:
+                logger.debug("Session completed, Cracked")
+                with open(self.outfile_name, 'r') as outfile:
+                    self.cracked = outfile.read()
+                    outfile.close()
+        # process exited, update stuff
+        if self._do_clean_up:
+            self.clean_up()
         self.stop_event.set()
 
+    def run(self, command_line, stats_timer=1):
+        self.stop_event.clear()
+        self.command_line = self.build_command_line(command_line)
+        self.state = self.STATE_STARTING
+        self.process = subprocess.Popen(self.command_line, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, stdin=subprocess.PIPE)
+        self.state = self.STATE_STARTING
+        t = threading.Thread(target=self.status_monitor)    
+        t.daemon = True
+        t.start()
+        while not self.stop_event.is_set():
+            time.sleep(1)
+        t.join()
+        logger.debug("Done.")
+
     def clean_up(self):
-        if not self._do_clean_up:
-            return
-
-        output = None
-        if EXIT_ERROR == self.process.returncode:
-            output = self.get_output()
-        elif EXIT_CRACKED == self.process.returncode:
-            try:
-                with open(self.outfile_name, 'r') as outfile:
-                    _cracked = outfile.read()
-                    outfile.close()
-            except IOError:
-                _cracked = ""
-            if len(_cracked) == 0:
-                output = "Found in POT file"
-            elif INCLUDE_CRACKED:
-                output = _cracked
-
         if self._delete_outfile:
             try:
                 os.remove(self.outfile_name)
             except OSError as e:
                 pass
-        self.output = output
+
+    def is_running(self):
+        return self.run_event.is_set()
+
+    def is_paused(self):
+        return self.p_event.is_set()
 
     def _get_line(self):
-        if self.process and self.process.poll() is None:
-            return self.process.stdout.readline()
+        if self.is_running():
+            line = self.process.stdout.readline()
         else:
             return ""
 
     def _send_line(self, line):
-        if self.process and self.process.poll() is None:
+        if self.is_running():
             self.process.stdin.write(line)
 
-    def wait_for_pattern(self, pattern):
-        line = self._get_line()
-        while self.process and self.process.poll() is None:
-            if pattern in line:
-                return line
-            else:
-                line = self._get_line()
-        return ""
-
     def get_stats(self):
-        self._send_line('s')
-        return self.wait_for_pattern('STATUS')
+        return self.stats
 
     def pause(self):
+        if not self.is_running() or self.p_event.is_set():
+            return False
+        logger.debug('Pausing...')
         self._send_line('p')
-        if 'Paused' in self.wait_for_pattern('Paused'):
-            return True
-        return False
+        # Wait for status monitor to confirm paused
+        return self.p_event.wait(2)
 
     def resume(self):
+        logger.debug('resuming...')
         self._send_line('r')
-        if 'Resumed' in self.wait_for_pattern('Resumed'):
-            return True
-        return False
+        # Wait for status_monitor to get the resumed line
+        while self.p_event.is_set() and self.is_running():
+            time.sleep(.5)
+        return True
 
     def quit(self):
-        if self.process.poll() is None:
+        if self.is_running:
             self._send_line('q')
-            self.parse_status_line(self.wait_for_pattern('STATUS'))
-            self.clean_up()
 
-    def parse_status_line(self, status_line=None):
+    def parse_status_line(self, status_line):
         stats = {}
-        if status_line is None:
-            status_line = self.get_stats()
-
         if not status_line.startswith("STATUS"):
-            return
-
+            return None
         for key, value in re.findall(STATUS_LINE_RE, status_line):
             value = value.strip()
             if 'SPEED' == key:
@@ -190,9 +227,4 @@ class HashcatController(object):
                 else:
                     value = int(value)
             stats[key] = value
-        self.stats = stats
         return stats
-
-    def get_output(self):
-        (stdout, stderr) = self.process.communicate()
-        return "\n".join(l for l in stdout.split('\n') + stderr.split('\n') if l)
