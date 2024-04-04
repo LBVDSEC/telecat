@@ -170,7 +170,7 @@ def launch(bot, update, args, job_queue):
     if args:
         run_async(hashcat.run)(args)
         run_async(session_monitor)(bot)
-        
+
         while not hashcat.is_running():
             if hashcat.process and hashcat.process.returncode:
                 break
@@ -277,8 +277,8 @@ def main():
     dp.add_handler(CommandHandler('resume', resume))
     dp.add_handler(CommandHandler('quit', quit))
     dp.add_handler(CommandHandler('launch', launch, pass_args=True, pass_job_queue=True))
-    dp.add_handler(MessageHandler([Filters.command], unknown))
-    dp.add_handler(MessageHandler([Filters.document], receive_file))
+    dp.add_handler(MessageHandler(Filters.command, unknown))
+    dp.add_handler(MessageHandler(Filters.document, receive_file))
 
     updater.start_polling()
     updater.idle()
